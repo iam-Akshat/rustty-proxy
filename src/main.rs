@@ -1,12 +1,13 @@
-#![deny(clippy::all)]
-
 mod balancer;
 mod config;
 pub mod util;
 
-use ::futures::future::join_all;
+use ::futures::future::{join_all, try_join};
+use async_recursion::async_recursion;
+use log::{debug, info};
 use std::sync::Arc;
 use tokio::{
+    io,
     net::{TcpListener, TcpStream},
     sync::RwLock,
 };
@@ -17,9 +18,9 @@ use util::targets_status_check;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config_path = std::env::args().nth(1).unwrap_or_else(|| {
-        "config.json".to_string()
-    });
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "config.json".to_string());
 
     let config = get_config(config_path).clone();
 
@@ -29,10 +30,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Starting proxy for App: {:?}", proxy_config.name);
         let ports = proxy_config.ports.clone();
         let targets = proxy_config.targets.clone();
+        let load_balancer = Arc::new(RwLock::new(LoadBalancer::new(
+            &targets,
+            &vec![1; targets.len()],
+        )));
 
+        let mut health_checker_clone = load_balancer.clone();
+        tokio::spawn(async move {
+            loop {
+                targets_status_check(&mut health_checker_clone).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            }
+        });
         for port in ports {
-            let targets = targets.clone();
-            handles.push(start_proxy(port, targets));
+            handles.push(start_proxy(port, load_balancer.clone()));
         }
     }
     join_all(handles).await;
@@ -42,60 +53,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn start_proxy(
     server_port: u16,
-    targets: Vec<String>,
+    load_balancer: Arc<RwLock<LoadBalancer>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", server_port))
-        .await
-        .unwrap();
-
-    let the_load_balancer = Arc::new(RwLock::new(LoadBalancer::new(
-        &targets,
-        &vec![1; targets.len()],
-    )));
-    // targets_status_check(&mut the_load_balancer).await;
-    let mut health_checker_clone = the_load_balancer.clone();
-    tokio::spawn(async move {
-        loop {
-            targets_status_check(&mut health_checker_clone).await;
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    let listener = match TcpListener::bind(format!("127.0.0.1:{}", server_port)).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("Error binding to port: {}", server_port);
+            return Err(Box::new(e));
         }
-    });
+    };
+    // match error kind and return
 
-    while let Ok((mut inbound, _)) = listener.accept().await {
+    while let Ok((inbound, _)) = listener.accept().await {
         // current time in milliseconds
-        let thread_lb = the_load_balancer.clone();
-
+        let thread_lb = load_balancer.clone();
+        if thread_lb.read().await.is_active == false {
+            println!("No active targets");
+            continue;
+        }
         tokio::spawn(async move {
-            let target = thread_lb.read().await.get_target();
-            let mut outbound = match TcpStream::connect(&target).await {
-                Ok(stream) => stream,
+            match handle_connection(inbound, thread_lb, 0).await {
+                Ok(_) => {}
                 Err(e) => {
-                    println!(
-                        "Error connecting to target ${:?} {:?}",
-                        target,
-                        e.to_string()
-                    );
-                    thread_lb.write().await.update_weight(target, 0);
-                    drop(thread_lb);
-                    return;
+                    eprintln!("Error handling connection: {}", e);
                 }
             };
-
-            // this is where we could do some packe manitpulation too
-            match tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await {
-                Ok((server_bytes, client_bytes)) => {
-                    println!(
-                        "Connection closed with {} bytes written",
-                        server_bytes + client_bytes
-                    );
-                    println!("Target: {}", target);
-                }
-                Err(e) => {
-                    println!("Error: {:?}", e.to_string());
-                }
-            }
         });
     }
+
+    Ok(())
+}
+
+#[async_recursion]
+async fn handle_connection(
+    mut inbound: TcpStream,
+    load_balancer: Arc<RwLock<LoadBalancer>>,
+    try_count: u8,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if try_count > 3 {
+        info!("Enough retries, giving up");
+        return Ok(());
+    }
+    let target = load_balancer.read().await.get_target();
+    let mut outbound = match TcpStream::connect(&target).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            println!(
+                "Error connecting to target ${:?} {:?}",
+                target,
+                e.to_string()
+            );
+            load_balancer.write().await.update_weight(target, 0);
+            return handle_connection(inbound, load_balancer, try_count + 1).await;
+        }
+    };
+
+    let (mut ri, mut wi) = inbound.split();
+    let (mut ro, mut wo) = outbound.split();
+    // packet manipulation possible here
+    let client_to_server = io::copy(&mut ri, &mut wo);
+    let server_to_client = io::copy(&mut ro, &mut wi);
+
+    let (bytes_c2s, bytes_s2c) = try_join(client_to_server, server_to_client).await?;
+    debug!(
+        "Connection closed with {} bytes received and {} bytes sent",
+        bytes_c2s, bytes_s2c
+    );
 
     Ok(())
 }

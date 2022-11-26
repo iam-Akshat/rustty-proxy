@@ -13,10 +13,12 @@ pub async fn targets_status_check(lb: &mut Arc<RwLock<LoadBalancer>>) {
     let is_updated = Arc::new(AtomicBool::new(false));
     for (target, weight) in target_weights.into_iter() {
         let target = target.clone();
-        let mut lb = lb.clone();
+        let lb = lb.clone();
         let is_updated = is_updated.clone();
+
         handles.push(tokio::spawn(async move {
             let stream = TcpStream::connect(&target).await;
+
             match stream {
                 Ok(_) => {
                     if weight == 0 {
@@ -37,6 +39,7 @@ pub async fn targets_status_check(lb: &mut Arc<RwLock<LoadBalancer>>) {
     }
 
     join_all(handles).await;
+
     if is_updated.load(std::sync::atomic::Ordering::Relaxed) {
         println!("Updated weight");
         lb.read().await.print_targets_state();
