@@ -30,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Starting proxy for App: {:?}", proxy_config.name);
         let ports = proxy_config.ports.clone();
         let targets = proxy_config.targets.clone();
+        
         let load_balancer = Arc::new(RwLock::new(LoadBalancer::new(
             &targets,
             &vec![1; targets.len()],
@@ -62,15 +63,15 @@ async fn start_proxy(
             return Err(Box::new(e));
         }
     };
-    // match error kind and return
 
     while let Ok((inbound, _)) = listener.accept().await {
-        // current time in milliseconds
         let thread_lb = load_balancer.clone();
+
         if thread_lb.read().await.is_active == false {
             println!("No active targets");
             continue;
         }
+
         tokio::spawn(async move {
             match handle_connection(inbound, thread_lb, 0).await {
                 Ok(_) => {}
